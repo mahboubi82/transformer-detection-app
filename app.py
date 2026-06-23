@@ -1,4 +1,4 @@
-import gradio as gr
+import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
@@ -10,32 +10,48 @@ from PIL import Image
 import io
 
 # ── Config ────────────────────────────────────────────────────────────────────
+CONF_THRESHOLD = 0.75
 CLASS_NAME     = "Transformer"
-CONF_DEFAULT   = 0.75
-DEVICE         = "mps"   # → "cpu" sur serveur sans GPU
+PAGE_TITLE     = "Transformer Detection — NBPower"
 
-# ── Modeles disponibles ───────────────────────────────────────────────────────
-MODELS = {
-    "YOLO26m   — mAP@50: 0.943 (recommandé)"  : "runs/yolo26m/weights/best.pt",
-    "RT-DETR-l — mAP@50: 0.924 (haute precision)" : "runs/rtdetr-l/weights/best.pt",
-}
+st.set_page_config(
+    page_title=PAGE_TITLE,
+    page_icon="🔌",
+    layout="wide",
+)
 
-# ── Cache modeles ─────────────────────────────────────────────────────────────
-_model_cache = {}
+# ── CSS ───────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .metric-card {
+        background: #f0f2f6;
+        border-radius: 10px;
+        padding: 1rem 1.5rem;
+        text-align: center;
+    }
+    .metric-value { font-size: 2rem; font-weight: 700; color: #1f77b4; }
+    .metric-label { font-size: 0.85rem; color: #666; }
+    .stProgress > div > div { background-color: #1f77b4; }
+</style>
+""", unsafe_allow_html=True)
 
-def get_model(model_label: str):
-    path = MODELS[model_label]
-    if path not in _model_cache:
-        _model_cache[path] = YOLO(path)
-    return _model_cache[path]
+# ── Load model (cache par chemin) ─────────────────────────────────────────────
+@st.cache_resource
+def load_model(model_path: str):
+    return YOLO(model_path)
 
 # ── Inference ─────────────────────────────────────────────────────────────────
-def run_inference(model, image_bgr: np.ndarray, conf: float):
-    result = model.predict(source=image_bgr, conf=conf, device=DEVICE, verbose=False)[0]
-    return result
+def run_inference(model, image: np.ndarray, conf: float):
+    results = model.predict(
+        source=image,
+        conf=conf,
+        device="mps",   # → "cpu" sur Streamlit Cloud
+        verbose=False,
+    )
+    return results[0]
 
-def draw_boxes(image_bgr: np.ndarray, result) -> np.ndarray:
-    img = image_bgr.copy()
+def draw_boxes(image: np.ndarray, result) -> np.ndarray:
+    img = image.copy()
     for box in result.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         conf = float(box.conf[0])
@@ -59,144 +75,204 @@ def build_dataframe(result) -> pd.DataFrame:
             "Largeur (px)": x2 - x1,
             "Hauteur (px)": y2 - y1,
         })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    return pd.DataFrame(rows)
 
-# ── Fonction principale image ─────────────────────────────────────────────────
-def predict_image(image: np.ndarray, model_label: str, conf: float):
-    if image is None:
-        return None, "Aucune image fournie.", pd.DataFrame()
-
-    model     = get_model(model_label)
-    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    result    = run_inference(model, image_bgr, conf)
-
+def show_results(image_bgr: np.ndarray, result):
     n     = len(result.boxes)
     confs = [float(b.conf[0]) for b in result.boxes]
     avg   = np.mean(confs) if confs else 0.0
     best  = max(confs)     if confs else 0.0
 
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{n}</div>
+            <div class="metric-label">Transformateurs détectés</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{avg:.0%}</div>
+            <div class="metric-label">Confiance moyenne</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div class="metric-card">
+            <div class="metric-value">{best:.0%}</div>
+            <div class="metric-label">Meilleure confiance</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
     annotated_rgb = cv2.cvtColor(draw_boxes(image_bgr, result), cv2.COLOR_BGR2RGB)
-    stats = f"Détectés : {n}  |  Confiance moy : {avg:.0%}  |  Meilleure : {best:.0%}"
-    df    = build_dataframe(result)
+    st.image(annotated_rgb, caption="Résultat de détection", use_container_width=True)
 
-    return annotated_rgb, stats, df
+    if n > 0:
+        st.markdown("#### Détails par détection")
+        df = build_dataframe(result)
+        st.dataframe(df, use_container_width=True)
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Exporter CSV", csv, "detections.csv", "text/csv")
+    else:
+        st.info("Aucun transformateur détecté avec ce seuil de confiance.")
 
-# ── Fonction URL ──────────────────────────────────────────────────────────────
-def predict_url(url: str, model_label: str, conf: float):
-    if not url:
-        return None, "URL vide.", pd.DataFrame()
-    try:
-        response  = requests.get(url, timeout=10)
-        response.raise_for_status()
-        image_pil = Image.open(io.BytesIO(response.content)).convert("RGB")
-        image_np  = np.array(image_pil)
-        return predict_image(image_np, model_label, conf)
-    except Exception as e:
-        return None, f"Erreur : {e}", pd.DataFrame()
+# ── UI principale ─────────────────────────────────────────────────────────────
+st.title("🔌 Transformer Detection")
+st.caption("Détection automatique de transformateurs sur poteau — NBPower")
 
-# ── Fonction vidéo ────────────────────────────────────────────────────────────
-def predict_video(video_path: str, model_label: str, conf: float):
-    if not video_path:
-        return None, "Aucune vidéo fournie.", pd.DataFrame()
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Paramètres")
 
-    model = get_model(model_label)
-    cap   = cv2.VideoCapture(video_path)
-    fps   = cap.get(cv2.CAP_PROP_FPS) or 25
-    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # ── Chargement du modèle ──────────────────────────────────────────────────
+    st.markdown("### 🧠 Modèle")
 
-    out_path = tempfile.mktemp(suffix=".mp4")
-    writer   = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    model_source = st.radio(
+        "Source",
+        ["Chemin local", "Upload fichier"],
+        horizontal=True,
+    )
 
-    all_detections = []
-    frame_idx = 0
+    model_path = None
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % 5 == 0:
-            result = run_inference(model, frame, conf)
-            frame  = draw_boxes(frame, result)
-            for box in result.boxes:
-                all_detections.append({
-                    "Frame": frame_idx,
-                    "Temps (s)": round(frame_idx / fps, 2),
-                    "Confiance": f"{float(box.conf[0]):.2%}",
-                })
-        writer.write(frame)
-        frame_idx += 1
-
-    cap.release()
-    writer.release()
-
-    df    = pd.DataFrame(all_detections) if all_detections else pd.DataFrame()
-    stats = f"{len(all_detections)} détections sur {frame_idx} frames"
-    return out_path, stats, df
-
-# ── Interface Gradio ──────────────────────────────────────────────────────────
-with gr.Blocks(title="Transformer Detection — NBPower", theme=gr.themes.Soft()) as demo:
-
-    gr.Markdown("# 🔌 Transformer Detection — NBPower")
-    gr.Markdown("Détection automatique de transformateurs sur poteau | YOLOv26m & RT-DETR-l")
-
-    # Paramètres communs
-    with gr.Row():
-        model_dd = gr.Dropdown(
-            choices=list(MODELS.keys()),
-            value=list(MODELS.keys())[0],
-            label="Modèle",
+    if model_source == "Chemin local":
+        model_path_input = st.text_input(
+            "Chemin vers le fichier .pt",
+            value="runs/transformer-v1/weights/best.pt",
+            placeholder="runs/mon-modele/weights/best.pt",
         )
-        conf_slider = gr.Slider(
-            minimum=0.1, maximum=1.0, value=CONF_DEFAULT, step=0.05,
-            label="Seuil de confiance",
-            info="0.75 = optimal (F1 max) | 0.856 = zéro faux positif"
+        if model_path_input and Path(model_path_input).exists():
+            model_path = model_path_input
+        elif model_path_input:
+            st.error("Fichier introuvable.")
+
+    else:  # Upload fichier
+        uploaded_model = st.file_uploader(
+            "Glisser-déposer un fichier .pt",
+            type=["pt"],
         )
+        if uploaded_model:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
+            tmp.write(uploaded_model.read())
+            tmp.flush()
+            model_path = tmp.name
+            st.success(f"✅ {uploaded_model.name}")
 
-    with gr.Tabs():
+    st.markdown("---")
 
-        # ── Tab Image ────────────────────────────────────────────────────────
-        with gr.Tab("📷 Image"):
-            with gr.Row():
-                img_input  = gr.Image(label="Image source", type="numpy")
-                img_output = gr.Image(label="Résultat")
-            img_stats = gr.Textbox(label="Statistiques", interactive=False)
-            img_table = gr.Dataframe(label="Détails", interactive=False)
-            img_btn   = gr.Button("🔍 Analyser", variant="primary")
+    # ── Seuil de confiance ────────────────────────────────────────────────────
+    conf = st.slider(
+        "Seuil de confiance",
+        min_value=0.1, max_value=1.0,
+        value=CONF_THRESHOLD, step=0.05,
+        help="0.75 = optimal (F1 max)"
+    )
+    st.markdown("**Seuils recommandés**")
+    st.markdown("- `0.75` — meilleur F1 (production)")
+    st.markdown("- `0.856` — zéro faux positif (alertes)")
 
-            img_btn.click(
-                fn=predict_image,
-                inputs=[img_input, model_dd, conf_slider],
-                outputs=[img_output, img_stats, img_table],
-            )
+    # ── Info modèle actif ─────────────────────────────────────────────────────
+    if model_path:
+        st.markdown("---")
+        st.markdown("**Modèle actif**")
+        name = uploaded_model.name if model_source == "Upload fichier" and uploaded_model else Path(model_path).name
+        st.code(name)
 
-        # ── Tab Vidéo ────────────────────────────────────────────────────────
-        with gr.Tab("🎬 Vidéo"):
-            vid_input  = gr.Video(label="Vidéo source")
-            vid_output = gr.Video(label="Résultat annoté")
-            vid_stats  = gr.Textbox(label="Statistiques", interactive=False)
-            vid_table  = gr.Dataframe(label="Détections par frame", interactive=False)
-            vid_btn    = gr.Button("▶️ Analyser", variant="primary")
+# ── Chargement du modèle ──────────────────────────────────────────────────────
+if not model_path:
+    st.warning("⬅️ Charge un modèle dans la sidebar pour commencer.")
+    st.stop()
 
-            vid_btn.click(
-                fn=predict_video,
-                inputs=[vid_input, model_dd, conf_slider],
-                outputs=[vid_output, vid_stats, vid_table],
-            )
+try:
+    model = load_model(model_path)
+except Exception as e:
+    st.error(f"Impossible de charger le modèle : {e}")
+    st.stop()
 
-        # ── Tab URL ──────────────────────────────────────────────────────────
-        with gr.Tab("🌐 URL"):
-            url_input  = gr.Textbox(label="URL de l'image", placeholder="https://example.com/image.jpg")
-            url_output = gr.Image(label="Résultat")
-            url_stats  = gr.Textbox(label="Statistiques", interactive=False)
-            url_table  = gr.Dataframe(label="Détails", interactive=False)
-            url_btn    = gr.Button("🔍 Analyser", variant="primary")
+# ── Onglets ───────────────────────────────────────────────────────────────────
+tab_img, tab_vid, tab_url = st.tabs(["📷 Image", "🎬 Vidéo", "🌐 URL"])
 
-            url_btn.click(
-                fn=predict_url,
-                inputs=[url_input, model_dd, conf_slider],
-                outputs=[url_output, url_stats, url_table],
-            )
+# ── Tab Image ─────────────────────────────────────────────────────────────────
+with tab_img:
+    uploaded = st.file_uploader(
+        "Glisser-déposer une image",
+        type=["jpg", "jpeg", "png", "webp"],
+    )
+    if uploaded:
+        file_bytes = np.frombuffer(uploaded.read(), np.uint8)
+        image_bgr  = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        with st.spinner("Analyse en cours..."):
+            result = run_inference(model, image_bgr, conf)
+        show_results(image_bgr, result)
 
-if __name__ == "__main__":
-    demo.launch(share=False)
+# ── Tab Vidéo ─────────────────────────────────────────────────────────────────
+with tab_vid:
+    uploaded_vid = st.file_uploader(
+        "Glisser-déposer une vidéo",
+        type=["mp4", "mov", "avi", "mkv"],
+    )
+    if uploaded_vid:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(uploaded_vid.read())
+        tfile.flush()
+
+        cap          = cv2.VideoCapture(tfile.name)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 25
+
+        st.info(f"Vidéo : {total_frames} frames à {fps:.0f} fps")
+        process_every = st.slider("Analyser 1 frame sur N", 1, 30, 5)
+
+        if st.button("▶️ Lancer l'analyse"):
+            frame_placeholder = st.empty()
+            progress          = st.progress(0)
+            all_detections    = []
+            frame_idx         = 0
+            processed         = 0
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx % process_every == 0:
+                    result        = run_inference(model, frame, conf)
+                    annotated     = draw_boxes(frame, result)
+                    annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                    frame_placeholder.image(annotated_rgb, use_container_width=True)
+                    for box in result.boxes:
+                        all_detections.append({
+                            "Frame": frame_idx,
+                            "Temps (s)": round(frame_idx / fps, 2),
+                            "Confiance": f"{float(box.conf[0]):.2%}",
+                        })
+                    processed += 1
+                progress.progress(min(frame_idx / max(total_frames, 1), 1.0))
+                frame_idx += 1
+
+            cap.release()
+            progress.progress(1.0)
+            st.success(f"✅ Analyse terminée — {processed} frames traitées")
+
+            if all_detections:
+                df_vid = pd.DataFrame(all_detections)
+                st.dataframe(df_vid, use_container_width=True)
+                csv = df_vid.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Exporter CSV", csv, "detections_video.csv", "text/csv")
+            else:
+                st.info("Aucun transformateur détecté dans la vidéo.")
+
+# ── Tab URL ───────────────────────────────────────────────────────────────────
+with tab_url:
+    url = st.text_input("URL de l'image", placeholder="https://example.com/image.jpg")
+    if url and st.button("🔍 Analyser"):
+        try:
+            with st.spinner("Téléchargement..."):
+                response  = requests.get(url, timeout=10)
+                response.raise_for_status()
+                image_pil = Image.open(io.BytesIO(response.content)).convert("RGB")
+                image_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+            with st.spinner("Analyse en cours..."):
+                result = run_inference(model, image_bgr, conf)
+            show_results(image_bgr, result)
+        except requests.exceptions.RequestException as e:
+            st.error(f"Erreur lors du téléchargement : {e}")
+        except Exception as e:
+            st.error(f"Erreur : {e}")
